@@ -79,27 +79,30 @@ def norm_key(name):
 
 
 def classify(a, b):
-    """Decide que archivo se invierte. Devuelve (keeper, inverted, suffix) o None.
-    keeper = el que NO se invierte y da el nombre de salida."""
+    """Decide que archivo se invierte. Devuelve (keeper, inverted, suffix, name_src)
+    o None. keeper = el que NO se invierte (se queda su duracion completa).
+    name_src = archivo cuyo nombre se usa para la salida."""
     na, nb = base_noext(a), base_noext(b)
     ea, eb = has_hint(na, EXT_HINTS), has_hint(nb, EXT_HINTS)
     if ea != eb:                          # uno es extended -> modo INVERT
-        inverted = a if ea else b
-        keeper = b if ea else a           # el otro = radio edit
-        return keeper, inverted, "Invert"
+        ext = a if ea else b              # extended = KEEPER (duracion completa)
+        radio = b if ea else a            # radio edit = se invierte
+        # "extended sin el radio": se resta el radio del extended y quedan las
+        # partes exclusivas del extended. Nombre = el del radio (nombre limpio).
+        return ext, radio, "Invert", radio
     ia, ib = has_hint(na, INST_HINTS), has_hint(nb, INST_HINTS)
     if ia != ib:                          # uno es instrumental -> modo ACAPELLA
         inverted = a if ia else b
-        keeper = b if ia else a           # el otro = original
-        return keeper, inverted, "Aca Invert"
-    # sin etiquetas: usar duracion (mas largo = extended, se invierte)
+        keeper = b if ia else a           # el otro = original (keeper y nombre)
+        return keeper, inverted, "Aca Invert", keeper
+    # sin etiquetas: usar duracion (mas largo = extended = keeper)
     try:
         fa, fb = sf.info(a).frames, sf.info(b).frames
         sr = sf.info(a).samplerate or 44100
         if abs(fa - fb) > 0.5 * sr:
-            inverted = a if fa > fb else b
-            keeper = b if fa > fb else a
-            return keeper, inverted, "Invert"
+            ext = a if fa > fb else b     # el mas largo = keeper
+            radio = b if fa > fb else a
+            return ext, radio, "Invert", radio
     except Exception:
         pass
     return None                           # no se puede decidir con certeza
@@ -145,7 +148,7 @@ def process(cfg):
                 print(f"-> {group}\n   [omitido] no pude saber cual invertir "
                       f"(sin 'instrumental'/'extended' y misma duracion)\n")
                 continue
-            keeper, inverted, suffix = res
+            keeper, inverted, suffix, name_src = res
             mode = "ACAPELLA" if suffix == "Aca Invert" else "INVERT"
             print(f"-> {group}  [{mode}]")
             print(f"   keeper (queda): {os.path.basename(keeper)}")
@@ -182,7 +185,7 @@ def process(cfg):
             print(f"   offset        : {info['lag_samples']} muestras "
                   f"({info['lag_samples']/sr:+.3f}s)")
             print(f"   ganancia      : [{gtxt}]  modo={used_mode}")
-            dst = os.path.join(outp, f"{base_noext(keeper)} {suffix}.wav")
+            dst = os.path.join(outp, f"{base_noext(name_src)} {suffix}.wav")
             extra_db = core.write(dst, out, sr, subtype=cfg["output_subtype"])
             if extra_db < 0:
                 print(f"   [i] red de seguridad: {extra_db:.1f} dB extra para evitar clip")
