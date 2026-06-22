@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+config.json
+input/
+output/
+*.wav
+*.flac
+*.aif
+*.aiff
+.venv/

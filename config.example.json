@@ -1,0 +1,7 @@
+{
+  "input_folder": "input",
+  "output_folder": "output",
+  "gain_mode": "unity",
+  "fixed_db": -6.0,
+  "output_subtype": "PCM_24"
+}
