@@ -38,6 +38,16 @@ Otros `gain_mode`: `peak` (cuadra el techo de master por pico dBFS),
 `fixed` (dB manual con `fixed_db`), `auto` (mínimos cuadrados por energía —
 **no recomendado**, baja la instrumental de más).
 
+### Auto block-match (instrumental sin máster)
+
+Si la instrumental está en otro estado de procesamiento (p. ej. **sin máster**,
+mucho más baja), unity no cancela bien. La tool lo detecta solo: mide la
+ganancia óptima global y si se aleja más de `blockmatch_gain_db` (6 dB por
+defecto, conservador) de la unidad, usa **block-match** — inversión por bloques
+con ganancia y micro-desfase adaptativos que matchea nivel/EQ y sigue la deriva.
+Una instrumental solo un poco más baja **no** lo dispara. Se apaga con
+`auto_blockmatch: false`.
+
 Se configura desde el menú (opción 2) o editando `config.json`.
 
 ## Sample rate distinto entre los dos archivos

@@ -50,6 +50,83 @@ def find_offset(orig_mono, inst_mono, decim=8):
     return lo + int(l2[np.argmax(np.abs(cc2))])
 
 
+def align(orig, inst):
+    """Alinea y devuelve (lag, o_start, i_start, L) de la region de solape."""
+    lag = find_offset(orig.mean(1), inst.mean(1))
+    o_start = max(0, lag)
+    i_start = max(0, -lag)
+    L = min(orig.shape[0] - o_start, inst.shape[0] - i_start)
+    if L <= 0:
+        raise ValueError("No hay solape entre los dos archivos tras alinear.")
+    return lag, o_start, i_start, L
+
+
+def optimal_gain(orig, inst):
+    """Ganancia global optima (minimos cuadrados, mono) que necesita la instru
+    para igualar al original. ~1.0 = mismo nivel/master; lejos de 1 = la instru
+    esta a otro estado (p. ej. sin master, mucho mas baja)."""
+    _, o0, i0, L = align(orig, inst)
+    O = orig[o0:o0 + L].mean(1)
+    I = inst[i0:i0 + L].mean(1)
+    den = float(np.dot(I, I))
+    return float(np.dot(O, I) / den) if den > 0 else 1.0
+
+
+def invert_blockmatch(orig, inst, input_db=-6.0, block=8192, margin=24):
+    """Inversion por bloques: cada bloque con su ganancia y micro-desfase
+    propios. Matchea nivel/EQ del master y sigue la deriva. Para instrumentales
+    a otro estado de procesamiento (sin master). out = original - instru_match."""
+    k = 10.0 ** (input_db / 20.0)
+    orig = orig * k
+    inst = inst * k
+    lag, o0, i0, L = align(orig, inst)
+    O = orig[o0:o0 + L]
+    I = inst[i0:i0 + L]
+    hop = block // 2
+    win = signal.windows.hann(block, sym=False)
+    region = np.zeros((L, 2))
+    wsum = np.zeros(L)
+    Om = O.mean(1)
+    Im = I.mean(1)
+    for s in range(0, L - block, hop):
+        om = Om[s:s + block]
+        best = (1e18, 0)
+        for d in range(-margin, margin + 1):
+            a = s + d
+            if a < 0 or a + block > L:
+                continue
+            im = Im[a:a + block]
+            g = np.dot(om, im) / (np.dot(im, im) + 1e-12)
+            e = float(np.sum((om - g * im) ** 2))
+            if e < best[0]:
+                best = (e, d)
+        d = best[1]
+        a = s + d
+        if a < 0 or a + block > L:
+            region[s:s + block] += O[s:s + block] * win[:, None]
+            wsum[s:s + block] += win
+            continue
+        i_blk = I[a:a + block]
+        res = np.empty((block, 2))
+        for ch in range(2):
+            ic = i_blk[:, ch]
+            oc = O[s:s + block, ch]
+            g = np.dot(oc, ic) / (np.dot(ic, ic) + 1e-12)
+            res[:, ch] = oc - g * ic
+        region[s:s + block] += res * win[:, None]
+        wsum[s:s + block] += win
+    cov = wsum > 1e-6
+    wsum[~cov] = 1.0
+    region /= wsum[:, None]
+    out_region = O.copy()
+    out_region[cov] = region[cov]
+    out = orig.copy()
+    out[o0:o0 + L] = out_region
+    info = {"lag_samples": lag, "gains": ["adaptativo"],
+            "peak": float(np.max(np.abs(out))) if out.size else 0.0}
+    return out, info
+
+
 def invert(orig, inst, gain_mode="unity", fixed_db=0.0, input_db=-6.0):
     """Devuelve (resultado, info).
     input_db : se bajan AMBAS entradas este dB desde el principio (-6 por

@@ -14,6 +14,7 @@ Emparejado: subcarpetas con 2 archivos cada una (recomendado), o archivos
 sueltos en la raiz emparejados por nombre.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -42,6 +43,8 @@ def load_config():
         "input_db": -6.0,             # headroom en la entrada (anti-clip)
         "output_subtype": "PCM_24",   # PCM_16 | PCM_24 | FLOAT  (default 24)
         "samplerate": "lowest",       # lowest (default, nunca sube de rate) | original
+        "auto_blockmatch": True,      # auto: si la instru esta a otro nivel/master, usa block-match
+        "blockmatch_gain_db": 6.0,    # umbral: solo si |ganancia optima| > esto (conservador)
     }
     if os.path.exists(CONFIG):
         try:
@@ -156,14 +159,29 @@ def process(cfg):
                     orig = core.resample(orig, sr, target); sr = target
                 if sr2 != target:
                     inst = core.resample(inst, sr2, target)
-            out, info = core.invert(orig, inst,
-                                    gain_mode=cfg["gain_mode"],
-                                    fixed_db=cfg["fixed_db"],
-                                    input_db=cfg["input_db"])
-            gtxt = ", ".join(f"{g:.3f}" for g in info["gains"])
+            # auto block-match: si la instru esta a otro nivel/master (ganancia
+            # optima lejos de 1) se usa block-match. Umbral conservador: una
+            # instru solo un poco mas baja NO lo dispara.
+            used_mode = cfg["gain_mode"]
+            if cfg.get("auto_blockmatch", True) and cfg["gain_mode"] == "unity":
+                g = core.optimal_gain(orig, inst)
+                gdb = 20 * math.log10(abs(g)) if g else 0.0
+                if abs(gdb) > cfg.get("blockmatch_gain_db", 6.0):
+                    print(f"   [auto] instru a {gdb:+.1f} dB del original "
+                          f"-> block-match (instru sin master)")
+                    out, info = core.invert_blockmatch(orig, inst, input_db=cfg["input_db"])
+                    used_mode = "block-match"
+                else:
+                    out, info = core.invert(orig, inst, gain_mode="unity",
+                                            input_db=cfg["input_db"])
+            else:
+                out, info = core.invert(orig, inst, gain_mode=cfg["gain_mode"],
+                                        fixed_db=cfg["fixed_db"], input_db=cfg["input_db"])
+            gtxt = ", ".join((g if isinstance(g, str) else f"{g:.3f}")
+                             for g in info["gains"])
             print(f"   offset        : {info['lag_samples']} muestras "
                   f"({info['lag_samples']/sr:+.3f}s)")
-            print(f"   ganancia      : [{gtxt}]  modo={cfg['gain_mode']}")
+            print(f"   ganancia      : [{gtxt}]  modo={used_mode}")
             dst = os.path.join(outp, f"{base_noext(keeper)} {suffix}.wav")
             extra_db = core.write(dst, out, sr, subtype=cfg["output_subtype"])
             if extra_db < 0:
