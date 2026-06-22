@@ -29,6 +29,159 @@ def resample(x, src_sr, dst_sr):
     return signal.resample_poly(x, up, down, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Correccion de DERIVA (drift) de velocidad / sample-clock.
+# Cuando los dos archivos se renderizaron a velocidades un pelin distintas
+# (p. ej. un bounce en tiempo real vs offline, o un SRC con otro reloj), el
+# desfase no es fijo: crece de forma LINEAL a lo largo del track. Un offset
+# unico cuadra una parte y se sale en el resto. Esto lo mide y lo corrige.
+# ---------------------------------------------------------------------------
+
+def _lowband(x, sr, fc=250.0):
+    """Filtra a graves (kick/bajo). Esa banda esta IGUAL en la mezcla con voz
+    y en la instrumental, asi que la correlacion es fiable aunque uno tenga voz."""
+    sos = signal.butter(4, fc, "lp", fs=sr, output="sos")
+    return signal.sosfiltfilt(sos, x)
+
+
+def measure_affine(orig, inst, sr, block_s=2.0, step_s=4.0, search=2000):
+    """Mide el mapeo afin  inst_idx = alpha*orig_idx + beta  por correlacion en
+    banda de graves, con ajuste robusto (rechazo de outliers / beat-hops).
+
+    alpha ~ 1 + (deriva en ppm)/1e6.  Devuelve (alpha, beta, info).
+    info: ok, ppm, drift_samples (deriva total acumulada), resid_std (que tan
+    recta es la deriva, en muestras), n_inliers, n_total.
+    """
+    om = orig.mean(1)
+    im = inst.mean(1)
+    ol = _lowband(om, sr)
+    il = _lowband(im, sr)
+
+    # offset global grueso (decimado) para centrar la busqueda por bloque
+    D = 8
+    ad = signal.decimate(ol, D, ftype="fir")
+    idd = signal.decimate(il, D, ftype="fir")
+    cc = signal.correlate(ad, idd, "full", "fft")
+    lags = signal.correlation_lags(len(ad), len(idd), "full")
+    g0 = int(lags[np.argmax(np.abs(cc))]) * D
+    # convencion de align(): i_start = max(0,-lag), o sea inst_idx ~ orig_idx - lag
+    i0 = -g0  # inst_idx ~ orig_idx + i0 al inicio
+
+    blk = int(block_s * sr)
+    step = max(1, int(step_s * sr))
+    N = min(len(ol), len(il))
+    xs, ys, ws = [], [], []
+    for o_s in range(2 * sr, N - blk, step):
+        i_s = o_s + i0
+        lo = max(0, i_s - search)
+        seg = il[lo:i_s + blk + search]
+        if i_s < 0 or len(seg) < blk + 4:
+            continue
+        a = ol[o_s:o_s + blk]
+        cc2 = signal.correlate(seg, a, "valid")
+        k = int(np.argmax(np.abs(cc2)))
+        b_abs = lo + k
+        bseg = il[b_abs:b_abs + blk]
+        r = abs(np.dot(a, bseg)) / (np.linalg.norm(a) * np.linalg.norm(bseg) + 1e-12)
+        xs.append(o_s)
+        ys.append(b_abs)
+        ws.append(r)
+
+    xs = np.array(xs, float)
+    ys = np.array(ys, float)
+    ws = np.array(ws, float)
+    if len(xs) < 5:
+        return 1.0, float(i0), {"ok": False, "reason": "pocos puntos", "n_total": len(xs)}
+
+    # ajuste robusto ponderado: rechazo iterativo de outliers (MAD)
+    mask = ws > max(0.4, np.median(ws) * 0.6)
+    if mask.sum() < 5:
+        mask = ws > 0.0
+    alpha, beta = 1.0, float(i0)
+    for _ in range(5):
+        if mask.sum() < 3:
+            break
+        alpha, beta = np.polyfit(xs[mask], ys[mask], 1, w=ws[mask])
+        resid = ys - (alpha * xs + beta)
+        med = np.median(resid[mask])
+        mad = np.median(np.abs(resid[mask] - med)) + 1e-9
+        newmask = np.abs(resid - med) < 4.0 * 1.4826 * mad
+        newmask &= ws > 0.0
+        if newmask.sum() >= 5 and not np.array_equal(newmask, mask):
+            mask = newmask
+        else:
+            break
+
+    resid = ys[mask] - (alpha * xs[mask] + beta)
+    info = {
+        "ok": True,
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "ppm": float((alpha - 1.0) * 1e6),
+        "drift_samples": float((alpha - 1.0) * N),
+        "resid_std": float(np.std(resid)) if len(resid) else 0.0,
+        "n_inliers": int(mask.sum()),
+        "n_total": int(len(xs)),
+    }
+    return float(alpha), float(beta), info
+
+
+def needs_drift(info, min_drift_samples=4.0, max_resid=10.0, max_ppm=5000.0):
+    """Decide si vale la pena corregir deriva: significativa, lineal (residual
+    bajo) y dentro de rango de reloj (no una diferencia de sample-rate/tempo)."""
+    if not info.get("ok"):
+        return False
+    return (abs(info["drift_samples"]) >= min_drift_samples
+            and info["resid_std"] <= max_resid
+            and abs(info["ppm"]) <= max_ppm
+            and info["n_inliers"] >= 5)
+
+
+def invert_affine(orig, inst, alpha, beta, input_db=-6.0, N=8192):
+    """Alinea inst a la grilla de orig con el mapeo afin (inst_idx=alpha*orig_idx
+    + beta) usando retardo fraccionario por bloques (FFT phase-ramp, banda
+    completa, precision sub-muestra) y resta: out = orig - inst_alineada.
+    Ganancia unity. Corrige la deriva de punta a punta."""
+    k = 10.0 ** (input_db / 20.0)
+    orig = orig * k
+    inst = inst * k
+    nch = orig.shape[1]
+    # igualar canales (si la instru es mono, se usa para ambos)
+    if inst.shape[1] < nch:
+        inst = np.repeat(inst[:, :1], nch, axis=1)
+
+    hop = N // 2
+    win = signal.windows.hann(N, sym=False)
+    kfreq = np.fft.rfftfreq(N)
+    Ia = np.zeros_like(orig)
+    wsum = np.zeros(len(orig))
+    for n0 in range(0, len(orig) - N, hop):
+        src = alpha * n0 + beta
+        i = int(np.floor(src))
+        frac = src - i
+        if i < 0 or i + N > len(inst):
+            continue
+        X = np.fft.rfft(inst[i:i + N, :nch], axis=0)
+        X *= np.exp(-1j * 2 * np.pi * kfreq * frac)[:, None]
+        d = np.fft.irfft(X, n=N, axis=0)
+        Ia[n0:n0 + N] += d * win[:, None]
+        wsum[n0:n0 + N] += win
+    cov = wsum > 1e-6
+    wsum[~cov] = 1.0
+    Ia /= wsum[:, None]
+
+    out = orig.copy()
+    out[cov] = orig[cov] - Ia[cov]
+    info = {
+        "lag_samples": int(round(beta)),
+        "gains": ["unity"],
+        "alpha": float(alpha),
+        "ppm": float((alpha - 1.0) * 1e6),
+        "peak": float(np.max(np.abs(out))) if out.size else 0.0,
+    }
+    return out, info
+
+
 def find_offset(orig_mono, inst_mono, decim=8):
     """Offset (en muestras) de la instrumental respecto al original.
     Puede ser negativo si la instrumental empieza antes. Busqueda coarse

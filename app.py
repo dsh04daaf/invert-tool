@@ -43,6 +43,7 @@ def load_config():
         "input_db": -6.0,             # headroom en la entrada (anti-clip)
         "output_subtype": "PCM_24",   # PCM_16 | PCM_24 | FLOAT  (default 24)
         "samplerate": "lowest",       # lowest (default, nunca sube de rate) | original
+        "drift": "auto",              # auto (detecta y corrige deriva de tempo/reloj) | off | on
         "auto_blockmatch": True,      # auto: si la instru esta a otro nivel/master, usa block-match
         "blockmatch_gain_db": 6.0,    # umbral: solo si |ganancia optima| > esto (conservador)
     }
@@ -162,19 +163,36 @@ def process(cfg):
                     orig = core.resample(orig, sr, target); sr = target
                 if sr2 != target:
                     inst = core.resample(inst, sr2, target)
-            # auto block-match: si la instru esta a otro nivel/master (ganancia
-            # optima lejos de 1) se usa block-match. Umbral conservador: una
-            # instru solo un poco mas baja NO lo dispara.
+            # Decision automatica de modo (solo en unity, el default):
+            #   1) DERIVA de tempo/reloj (desfase que crece lineal) -> drift-fix
+            #   2) instru a otro NIVEL/master (ganancia lejos de 1)  -> block-match
+            #   3) si nada de eso: unity simple (alinear + invertir)
+            # Si el usuario fijo peak/fixed/auto a mano, se respeta tal cual.
             used_mode = cfg["gain_mode"]
-            if cfg.get("auto_blockmatch", True) and cfg["gain_mode"] == "unity":
-                g = core.optimal_gain(orig, inst)
-                gdb = 20 * math.log10(abs(g)) if g else 0.0
-                if abs(gdb) > cfg.get("blockmatch_gain_db", 6.0):
-                    print(f"   [auto] instru a {gdb:+.1f} dB del original "
-                          f"-> block-match (instru sin master)")
-                    out, info = core.invert_blockmatch(orig, inst, input_db=cfg["input_db"])
-                    used_mode = "block-match"
-                else:
+            out = info = None
+            if cfg["gain_mode"] == "unity":
+                if cfg.get("drift", "auto") != "off":
+                    alpha, beta, di = core.measure_affine(orig, inst, sr)
+                    force = cfg.get("drift") == "on"
+                    if di.get("ok") and (force or core.needs_drift(di)):
+                        print(f"   deriva        : {di['ppm']:+.2f} ppm "
+                              f"({di['drift_samples']:+.0f} muestras en el track, "
+                              f"lineal +/-{di['resid_std']:.1f}) -> corrijo deriva")
+                        out, info = core.invert_affine(orig, inst, alpha, beta,
+                                                       input_db=cfg["input_db"])
+                        used_mode = "unity + drift-fix"
+                    elif di.get("ok") and abs(di["drift_samples"]) >= 1.0:
+                        print(f"   deriva        : {di['ppm']:+.2f} ppm "
+                              f"({di['drift_samples']:+.0f} muestras) -> despreciable, offset fijo")
+                if out is None and cfg.get("auto_blockmatch", True):
+                    g = core.optimal_gain(orig, inst)
+                    gdb = 20 * math.log10(abs(g)) if g else 0.0
+                    if abs(gdb) > cfg.get("blockmatch_gain_db", 6.0):
+                        print(f"   [auto] instru a {gdb:+.1f} dB del original "
+                              f"-> block-match (instru sin master)")
+                        out, info = core.invert_blockmatch(orig, inst, input_db=cfg["input_db"])
+                        used_mode = "block-match"
+                if out is None:
                     out, info = core.invert(orig, inst, gain_mode="unity",
                                             input_db=cfg["input_db"])
             else:
@@ -212,6 +230,11 @@ def configure(cfg):
         if v:
             try: cfg["fixed_db"] = float(v)
             except ValueError: pass
+    print("  Deriva (desfase de tempo/reloj que crece a lo largo del track):")
+    print("    auto = detecta y corrige si la hay | off = ignora | on = fuerza")
+    d = input(f"Correccion de deriva auto/off/on [{cfg.get('drift','auto')}]: ").strip().lower()
+    if d in ("auto", "off", "on"):
+        cfg["drift"] = d
     st = input(f"Formato salida PCM_16/PCM_24/FLOAT [{cfg['output_subtype']}]: ").strip().upper()
     if st in ("PCM_16", "PCM_24", "FLOAT"):
         cfg["output_subtype"] = st
