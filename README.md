@@ -1,25 +1,29 @@
 # InvertTool
 
-Inversión de fase por lotes para extraer acapellas. Dejas el par
-**original + instrumental** en una carpeta, encuentra el offset solo
-(correlación cruzada), invierte la instrumental y la resta:
+Inversión de fase por lotes. Dejas pares en una carpeta, encuentra el offset
+solo (correlación cruzada), invierte uno y lo resta del otro. Sin limpieza de
+residuos (eso lo haces aparte, p. ej. con un separador tipo Demucs/MDX).
 
-```
-acapella = original − instrumental
-```
+## Dos modos (detectados por el nombre)
 
-La instrumental es **siempre** la que se invierte. Sin limpieza de residuos
-(eso lo haces aparte si quieres, p. ej. con un separador tipo Demucs/MDX).
+| Modo | Detecta | Se invierte | Keeper | Salida |
+|---|---|---|---|---|
+| **Acapella** | `instrumental` / `inst` | la instrumental | el original | `<original> Aca Invert.wav` |
+| **Invert** | `extended` / `ext` | el extended | el radio edit | `<radio edit> Invert.wav` |
+
+En modo Invert el radio edit **no** necesita decir "radio": basta con que el
+otro diga "extended". El resultado se nombra según el keeper (el que no se
+invierte). La detección usa límites de palabra, así que `Next`/`Sextet` no
+disparan "ext".
 
 ## Uso
 
 1. Pon los pares en `input/`:
-   - dos archivos sueltos, uno con `instrumental` / `inst` en el nombre y el otro
-     el original, **o**
-   - una subcarpeta con exactamente 2 archivos.
+   - **subcarpetas con 2 archivos cada una** (recomendado para lotes: 6
+     archivos en 3 subcarpetas = 3 pares), **o**
+   - 2 archivos sueltos en la raíz (se emparejan por nombre).
 2. Corre `InvertTool` (o `python app.py`).
-3. Elige **1) Procesar**. El resultado sale en `output/` como
-   `<nombre> - acapella.wav`.
+3. Elige **1) Procesar**. El resultado sale en `output/`.
 
 ## Defaults
 

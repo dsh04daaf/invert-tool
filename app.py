@@ -1,23 +1,36 @@
 """
 InvertTool - inversion de fase por lotes.
-Deja pares (original + instrumental) en la carpeta input/ y entrega la
-acapella en output/. La instrumental es SIEMPRE la que se invierte.
+Deja pares en input/ y entrega el resultado de la inversion en output/.
 
-Emparejado: en cada par, el archivo cuyo nombre contiene 'instrumental' o
-'inst' es la instrumental; el otro es el original. Si una carpeta input/<sub>/
-tiene exactamente 2 archivos, tambien funciona.
+Dos modos, detectados por el nombre de los archivos:
+  - ACAPELLA : un archivo dice 'instrumental'/'inst'. Se invierte la
+               instrumental y se resta del original -> acapella.
+               Salida: "<original> Aca Invert.wav"
+  - INVERT   : un archivo dice 'extended'/'ext'. Se invierte el extended y se
+               resta del radio edit (el otro, aunque no diga 'radio').
+               Salida: "<radio edit> Invert.wav"
+
+Emparejado: subcarpetas con 2 archivos cada una (recomendado), o archivos
+sueltos en la raiz emparejados por nombre.
 """
 import json
 import os
+import re
 import sys
 import glob
+
+import soundfile as sf
 
 import invert_core as core
 
 HERE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 CONFIG = os.path.join(HERE, "config.json")
 AUDIO_EXT = (".wav", ".flac", ".aif", ".aiff")
-INST_HINTS = ("instrumental", "inst", "instru")
+INST_HINTS = ("instrumental", "instru", "instr", "inst")
+EXT_HINTS = ("extended", "extendedmix", "ext")
+# tokens que se quitan al normalizar nombres para emparejar archivos sueltos
+STRIP_HINTS = INST_HINTS + EXT_HINTS + ("radio edit", "radio", "short", "edit",
+                                        "original mix", "original", "mix")
 
 
 def load_config():
@@ -42,51 +55,72 @@ def save_config(cfg):
     json.dump(cfg, open(CONFIG, "w", encoding="utf-8"), indent=2)
 
 
-def is_inst(name):
+def base_noext(p):
+    return os.path.splitext(os.path.basename(p))[0]
+
+
+def has_hint(name, hints):
+    """True si algun hint aparece como token (no como subcadena de otra palabra,
+    para que 'ext' no pegue en 'next' ni 'inst' dentro de 'instrumental')."""
     n = name.lower()
-    return any(h in n for h in INST_HINTS)
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(h) + r"(?![a-z0-9])", n)
+               for h in hints)
+
+
+def norm_key(name):
+    """Clave para emparejar archivos sueltos: quita qualifiers y puntuacion."""
+    n = name.lower()
+    for h in sorted(STRIP_HINTS, key=len, reverse=True):
+        n = re.sub(r"(?<![a-z0-9])" + re.escape(h) + r"(?![a-z0-9])", "", n)
+    return re.sub(r"[^a-z0-9]", "", n)
+
+
+def classify(a, b):
+    """Decide que archivo se invierte. Devuelve (keeper, inverted, suffix) o None.
+    keeper = el que NO se invierte y da el nombre de salida."""
+    na, nb = base_noext(a), base_noext(b)
+    ea, eb = has_hint(na, EXT_HINTS), has_hint(nb, EXT_HINTS)
+    if ea != eb:                          # uno es extended -> modo INVERT
+        inverted = a if ea else b
+        keeper = b if ea else a           # el otro = radio edit
+        return keeper, inverted, "Invert"
+    ia, ib = has_hint(na, INST_HINTS), has_hint(nb, INST_HINTS)
+    if ia != ib:                          # uno es instrumental -> modo ACAPELLA
+        inverted = a if ia else b
+        keeper = b if ia else a           # el otro = original
+        return keeper, inverted, "Aca Invert"
+    # sin etiquetas: usar duracion (mas largo = extended, se invierte)
+    try:
+        fa, fb = sf.info(a).frames, sf.info(b).frames
+        sr = sf.info(a).samplerate or 44100
+        if abs(fa - fb) > 0.5 * sr:
+            inverted = a if fa > fb else b
+            keeper = b if fa > fb else a
+            return keeper, inverted, "Invert"
+    except Exception:
+        pass
+    return None                           # no se puede decidir con certeza
 
 
 def find_pairs(folder):
-    """Devuelve lista de (original_path, instrumental_path, base_name)."""
+    """Devuelve lista de (fileA, fileB, group_label)."""
     pairs = []
-    # 1) subcarpetas con 2 archivos
+    # 1) subcarpetas con exactamente 2 archivos
     for sub in sorted(glob.glob(os.path.join(folder, "*"))):
         if os.path.isdir(sub):
             files = [f for f in sorted(glob.glob(os.path.join(sub, "*")))
                      if f.lower().endswith(AUDIO_EXT)]
             if len(files) == 2:
-                inst = next((f for f in files if is_inst(os.path.basename(f))), files[1])
-                orig = next((f for f in files if f != inst), files[0])
-                pairs.append((orig, inst, os.path.basename(sub)))
-    # 2) archivos sueltos en la raiz: emparejar inst <-> original por nombre
+                pairs.append((files[0], files[1], os.path.basename(sub)))
+    # 2) archivos sueltos en la raiz: agrupar por nombre normalizado
     flat = [f for f in sorted(glob.glob(os.path.join(folder, "*")))
             if os.path.isfile(f) and f.lower().endswith(AUDIO_EXT)]
-    insts = [f for f in flat if is_inst(os.path.basename(f))]
-    origs = [f for f in flat if not is_inst(os.path.basename(f))]
-    used = set()
-    for inst in insts:
-        base = os.path.splitext(os.path.basename(inst))[0].lower()
-        for h in INST_HINTS:
-            base = base.replace(h, "")
-        base = base.strip(" -_().")
-        # original con nombre mas parecido
-        best, score = None, -1
-        for o in origs:
-            if o in used:
-                continue
-            ob = os.path.splitext(os.path.basename(o))[0].lower()
-            s = sum(1 for w in base.split() if w and w in ob)
-            if base and base in ob:
-                s += 5
-            if s > score:
-                best, score = o, s
-        if best is None and len(origs) == 1:
-            best = origs[0]
-        if best:
-            used.add(best)
-            name = os.path.splitext(os.path.basename(best))[0]
-            pairs.append((best, inst, name))
+    groups = {}
+    for f in flat:
+        groups.setdefault(norm_key(base_noext(f)), []).append(f)
+    for key, files in groups.items():
+        if len(files) == 2:
+            pairs.append((files[0], files[1], key))
     return pairs
 
 
@@ -97,22 +131,27 @@ def process(cfg):
     pairs = find_pairs(inp)
     if not pairs:
         print(f"\nNo encontre pares en {inp}")
-        print("  Pon original + instrumental (nombre con 'instrumental'/'inst'),")
-        print("  o subcarpetas con 2 archivos cada una.\n")
+        print("  Pon subcarpetas con 2 archivos cada una, o 2 archivos sueltos.")
+        print("  Etiqueta uno con 'instrumental'/'inst' (acapella) o 'extended'/'ext'.\n")
         return
     print(f"\n{len(pairs)} par(es) encontrados.\n")
-    for orig_p, inst_p, base in pairs:
+    for fa, fb, group in pairs:
         try:
-            print(f"-> {base}")
-            print(f"   original     : {os.path.basename(orig_p)}")
-            print(f"   instrumental : {os.path.basename(inst_p)}")
-            orig, sr = core.load(orig_p)
-            inst, sr2 = core.load(inst_p)
+            res = classify(fa, fb)
+            if not res:
+                print(f"-> {group}\n   [omitido] no pude saber cual invertir "
+                      f"(sin 'instrumental'/'extended' y misma duracion)\n")
+                continue
+            keeper, inverted, suffix = res
+            mode = "ACAPELLA" if suffix == "Aca Invert" else "INVERT"
+            print(f"-> {group}  [{mode}]")
+            print(f"   keeper (queda): {os.path.basename(keeper)}")
+            print(f"   se invierte   : {os.path.basename(inverted)}")
+            orig, sr = core.load(keeper)
+            inst, sr2 = core.load(inverted)
             if sr != sr2:
-                # objetivo: por defecto el del original (no se degrada el keeper)
                 target = min(sr, sr2) if cfg.get("samplerate") == "lowest" else sr
-                print(f"   sample rate   : original {sr} vs instru {sr2} "
-                      f"-> resampleo a {target} Hz")
+                print(f"   sample rate   : {sr} vs {sr2} -> resampleo a {target} Hz")
                 if sr != target:
                     orig = core.resample(orig, sr, target); sr = target
                 if sr2 != target:
@@ -122,10 +161,10 @@ def process(cfg):
                                     fixed_db=cfg["fixed_db"],
                                     input_db=cfg["input_db"])
             gtxt = ", ".join(f"{g:.3f}" for g in info["gains"])
-            print(f"   offset       : {info['lag_samples']} muestras "
+            print(f"   offset        : {info['lag_samples']} muestras "
                   f"({info['lag_samples']/sr:+.3f}s)")
             print(f"   ganancia      : [{gtxt}]  modo={cfg['gain_mode']}")
-            dst = os.path.join(outp, f"{base} - acapella.wav")
+            dst = os.path.join(outp, f"{base_noext(keeper)} {suffix}.wav")
             extra_db = core.write(dst, out, sr, subtype=cfg["output_subtype"])
             if extra_db < 0:
                 print(f"   [i] red de seguridad: {extra_db:.1f} dB extra para evitar clip")
