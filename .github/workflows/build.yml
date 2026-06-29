@@ -36,6 +36,7 @@ jobs:
         with:
           name: InvertTool-windows
           path: dist/InvertTool.exe
+          retention-days: 1
 
       - name: Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
